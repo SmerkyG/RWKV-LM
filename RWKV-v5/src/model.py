@@ -17,6 +17,21 @@ if importlib.util.find_spec('deepspeed'):
 
 # from deepspeed.runtime.fp16.onebit.zoadam import ZeroOneAdam
 
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from .teacher import calc_teacher2student_tok_idx, calc_student2teacher_tok_idx, calc_student2teacher_seqidx
+
+teacher_model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0" #"mistralai/Mixtral-8x7B-v0.1"
+teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_model_id, trust_remote_code=True)
+
+student_model_id = "RWKV/v5-Eagle-7B-HF"
+student_tokenizer = AutoTokenizer.from_pretrained(student_model_id, trust_remote_code=True)
+student_tokenizer.encoder[0] = bytes() # FIXME - hack to allow faster lookup
+
+teacher2student_tok_idx = calc_teacher2student_tok_idx(student_tokenizer, teacher_tokenizer)
+student2teacher_tok_idx = calc_student2teacher_tok_idx(student_tokenizer, teacher_tokenizer)
+
+teacher_model = AutoModelForCausalLM.from_pretrained(teacher_model_id)
+
 try:
     print('RWKV_MY_TESTING', os.environ["RWKV_MY_TESTING"])
 except:
@@ -548,6 +563,9 @@ class RWKV(pl.LightningModule):
         if args.dropout > 0:
             self.drop0 = nn.Dropout(p = args.dropout)
 
+        self.register_buffer("teacher2student_tok_idx", torch.LongTensor(teacher2student_tok_idx), persistent=False)
+        self.register_buffer("student2teacher_tok_idx", torch.LongTensor(student2teacher_tok_idx), persistent=False)
+
     def configure_optimizers(self):
         args = self.args
         
@@ -708,7 +726,117 @@ class RWKV(pl.LightningModule):
                 #             ccc += 1
                 #     print('rank', self.global_rank, 'loss', loss.item(), 'lavg', sss / ccc)#, 'tmp', tmp, 'input', idx)
 
-        return L2Wrap.apply(loss, logits)
+        student_logits = logits
+        with torch.no_grad():
+
+            global student_tokenizer, teacher_tokenizer       
+            # FIXME - do we need both the idx and targets combined somehow? or only one? which?
+            #print(idx.shape)
+            teacher_seqidx, teacher_input_ids = calc_student2teacher_seqidx(student_tokenizer, teacher_tokenizer, idx)
+            teacher_input_ids = teacher_input_ids.to(self.device)
+            #print(teacher_seqidx)
+            #print(teacher_input_ids)
+            teacher_seqidx = torch.tensor(teacher_seqidx, device=self.device)
+
+            use_tok = teacher_seqidx >= 0 # bool for each input, indicates if there's a student<->teacher token text-offset match
+            # using -1's won't work here..so we replace those with zeros via multiplication with use_tok
+            teacher_seqidx = teacher_seqidx * use_tok
+
+            # FIXME - KL loss between student and teacher where teacher2student_tok_idx != -1
+
+            global teacher_model
+            if next(teacher_model.parameters()).device != self.device:
+                teacher_model = teacher_model.to(self.device)
+
+            #teacher_input_ids = torch.zeros_like(idx)
+            #teacher_input_ids = self.student2teacher_tok_idx[idx]
+            
+            teacher_output = teacher_model(teacher_input_ids)
+            teacher_logits = teacher_output.logits.to(student_logits.dtype)
+
+
+            # # teacher_loss = F.cross_entropy(teacher_logits[:,:-1,:].contiguous().view(-1, teacher_logits.size(-1)), teacher_input_ids[:,1:].contiguous().view(-1))
+            # # print(teacher_loss.item())
+
+            # permute sequence inputs and logits to match student's sequence locations
+            TB,TS,TC = teacher_logits.shape
+            B,S,C = student_logits.shape
+            teacher_input_ids = teacher_input_ids.view(-1)[teacher_seqidx.view(-1)].view(B,S)
+            teacher_logits = teacher_logits.view(-1,TC)[teacher_seqidx.view(-1),:].view(B,S,TC)
+
+            # map teacher input token_ids and logits to student token_ids and logits
+            teacher_targets = self.teacher2student_tok_idx[teacher_input_ids[:, 1:]]
+            #teacher_logits = teacher_logits[:, :-1, self.student2teacher_tok_idx] # FIXME - what about overlaps? like teach elmer and elma could both map to student elm but we're only taking one of them, should probably add them?
+            #teacher_logits = torch.scatter_add(torch.zeros_like(student_logits[:,:-1,:]), dim=-1, index=self.teacher2student_tok_idx, src=teacher_logits)
+            teacher_logits = torch.index_add(input=torch.zeros_like(student_logits), dim=-1, index=self.teacher2student_tok_idx, source=teacher_logits)
+            teacher_logits = teacher_logits[:, :-1, :]
+
+            # # permute sequence inputs and logits to match student's sequence locations
+            # B,S,C = student_logits.shape
+            # teacher_targets = teacher_targets.view(-1)[teacher_seqidx.view(-1)].view(B,S)
+            # teacher_logits = teacher_logits.view(-1,C)[teacher_seqidx.view(-1),:].view(B,S,C)
+
+            # student_teacher_loss_fn = nn.KLDivLoss(reduction="none")#"batchmean")
+            # # # temp = 1.0
+            # # # student_logits = student_logits * use_tok.unsqueeze(-1)
+            # # # teacher_logits = teacher_logits * use_tok.unsqueeze(-1)
+            # # # student_teacher_loss = student_teacher_loss_fn( F.log_softmax(student_logits / temp, dim=-1), F.softmax(teacher_logits / temp, dim=-1) ) * (temp ** 2)
+            # # # #torch.gather(dim=-1, index=torch.arange(teacher_seqidx.size(-1)))
+            # #mask = (teacher_seqidx[:,1:] - teacher_seqidx[:,:-1]) == 1
+            # # we allow only tokens that end (not start) at the same location for both teacher and student
+            # mask = use_tok[:,:-1]
+            # mask = mask.contiguous().view(-1)
+            # # student_teacher_token_loss = student_teacher_loss_fn(F.log_softmax(student_logits[:,:-1,:].contiguous().view(-1,C), dim=-1), F.softmax(teacher_logits.contiguous().view(-1,C), dim=-1))
+            # # student_teacher_loss = torch.sum(student_teacher_token_loss * mask.unsqueeze(-1)) / (torch.sum(mask) + 1e-8)
+            # # print(student_teacher_loss)
+
+
+            teacher_token_loss = F.cross_entropy(teacher_logits.contiguous().view(-1, teacher_logits.size(-1)), teacher_targets.contiguous().view(-1), reduction="none")
+            # # need to get rid of tokens that had no reasonable target in student token id space
+            # # NOTE - have to check that both the input and target tokens were at a matched beginning location or it doesn't make sense to use this sequence index
+            mask = use_tok[:,:-1]
+            mask = mask.contiguous().view(-1)
+            teacher_loss = torch.sum(teacher_token_loss * mask) / (torch.sum(mask) + 1e-8)
+            #print(teacher_seqidx[0])
+
+            print(teacher_loss.item(), torch.sum(mask).item())
+
+            
+            # # permute sequence inputs and logits to match student's sequence locations
+            # # gather together the teacher outputs from student2teacher_seqidx
+            # TB,TS,TC = teacher_logits.shape
+            # B,S,C = student_logits.shape
+            # #print("student_logits.shape, teacher_logits.shape, teacher_seqidx.shape", student_logits.shape, teacher_logits.shape, teacher_seqidx.shape, torch.min(teacher_seqidx.view(-1)), torch.max(teacher_seqidx.view(-1)))
+            # #teacher_logits = torch.index_select(input=teacher_logits.view(-1,teacher_logits.size(-1)), dim=-2, index=teacher_seqidx.view(-1)).view(B,S,C)
+            # teacher_logits = teacher_logits.view(-1,TC)[teacher_seqidx.view(-1),:].view(B,S,TC)
+
+            # # translate teacher logits (32000) to student logits n_embd (65536)
+            # #teacher_logits = teacher_logits[..., self.student2teacher_tok_idx] # FIXME - would need student2teacher to do it this way! what about overlaps?
+            # teacher_logits = teacher_logits[:, :-1, self.student2teacher_tok_idx] # using :-1 because we can't tell if last offset is ok
+
+            # # student_teacher_loss_fn = nn.KLDivLoss(reduction="batchmean")
+            # # temp = 1.0
+            # # student_logits = student_logits * use_tok.unsqueeze(-1)
+            # # teacher_logits = teacher_logits * use_tok.unsqueeze(-1)
+            # # student_teacher_loss = student_teacher_loss_fn( F.log_softmax(student_logits / temp, dim=-1), F.softmax(teacher_logits / temp, dim=-1) ) * (temp ** 2)
+            # # #torch.gather(dim=-1, index=torch.arange(teacher_seqidx.size(-1)))
+
+            # teacher_token_loss = F.cross_entropy(teacher_logits.contiguous().view(-1, C), targets[:,:-1].contiguous().view(-1), reduction='none')
+            # # need to get rid of tokens that had no reasonable target in student token id space
+            # mask = use_tok[:,:-1] #(teacher_seqidx[:,1:] - teacher_seqidx[:,:-1]) == 1
+            # mask = mask.contiguous().view(-1)#(teacher_targets > 0).view(-1)
+            # #print(teacher_logits.shape, targets[:,:-1].shape,teacher_token_loss.shape, mask.shape, teacher_seqidx.shape)
+            # teacher_loss = torch.sum(teacher_token_loss * mask) / (torch.sum(mask) + 1e-8)
+            # print(teacher_loss.item())
+
+        #student_teacher_token_loss = student_teacher_loss_fn(F.log_softmax(student_logits[:,:-1,:].contiguous().view(-1,C), dim=-1), F.softmax(teacher_logits.contiguous().view(-1,C), dim=-1))
+        #student_teacher_loss = torch.sum(student_teacher_token_loss * mask.unsqueeze(-1)) / (torch.sum(mask) + 1e-8)
+
+        return loss
+        # print("Loss", loss)
+        # return student_teacher_loss
+        # return 0.5 * loss + 0.5 * student_teacher_loss
+        #return L2Wrap.apply(loss, logits)
 
     def training_step_end(self, batch_parts):
         if pl.__version__[0]!='2':
