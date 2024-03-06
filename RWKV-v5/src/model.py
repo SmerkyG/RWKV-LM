@@ -18,14 +18,17 @@ if importlib.util.find_spec('deepspeed'):
 # from deepspeed.runtime.fp16.onebit.zoadam import ZeroOneAdam
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from .teacher import calc_teacher2student_tok_idx, calc_student2teacher_tok_idx, calc_student2teacher_seqidx
+from .teacher import calc_teacher2student_tok_idx, calc_student2teacher_tok_idx, calc_student2teacher_seqidx, student_tokenizer
 
 teacher_model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0" #"mistralai/Mixtral-8x7B-v0.1"
 teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_model_id, trust_remote_code=True)
 
 student_model_id = "RWKV/v5-Eagle-7B-HF"
-student_tokenizer = AutoTokenizer.from_pretrained(student_model_id, trust_remote_code=True)
-student_tokenizer.encoder[0] = bytes() # FIXME - hack to allow faster lookup
+#student_tokenizer = AutoTokenizer.from_pretrained(student_model_id, trust_remote_code=True)
+#student_tokenizer.encoder[0] = bytes() # FIXME - hack to allow faster lookup
+#from tokenizer.rwkv_tokenizer import TRIE_TOKENIZER
+#student_tokenizer = TRIE_TOKENIZER("tokenizer/rwkv_vocab_v20230424.txt")
+#student_tokenizer.idx2token[0] = b'' # FIXME - hack to allow faster lookup
 
 teacher2student_tok_idx = calc_teacher2student_tok_idx(student_tokenizer, teacher_tokenizer)
 student2teacher_tok_idx = calc_student2teacher_tok_idx(student_tokenizer, teacher_tokenizer)
@@ -726,14 +729,15 @@ class RWKV(pl.LightningModule):
                 #             ccc += 1
                 #     print('rank', self.global_rank, 'loss', loss.item(), 'lavg', sss / ccc)#, 'tmp', tmp, 'input', idx)
 
+        #print(idx.tolist())
         student_logits = logits
         with torch.no_grad():
 
             global student_tokenizer, teacher_tokenizer       
             # FIXME - do we need both the idx and targets combined somehow? or only one? which?
             #print(idx.shape)
-            teacher_seqidx, teacher_input_ids = calc_student2teacher_seqidx(student_tokenizer, teacher_tokenizer, idx)
-            teacher_input_ids = teacher_input_ids.to(self.device)
+            teacher_seqidx, teacher_input_ids, input_text_batch = calc_student2teacher_seqidx(student_tokenizer, teacher_tokenizer, idx)
+            teacher_input_ids = torch.tensor(teacher_input_ids, dtype=torch.long, device=self.device)
             #print(teacher_seqidx)
             #print(teacher_input_ids)
             teacher_seqidx = torch.tensor(teacher_seqidx, device=self.device)
@@ -761,11 +765,20 @@ class RWKV(pl.LightningModule):
             # permute sequence inputs and logits to match student's sequence locations
             TB,TS,TC = teacher_logits.shape
             B,S,C = student_logits.shape
-            teacher_input_ids = teacher_input_ids.view(-1)[teacher_seqidx.view(-1)].view(B,S)
-            teacher_logits = teacher_logits.view(-1,TC)[teacher_seqidx.view(-1),:].view(B,S,TC)
+            teacher_input_ids = torch.gather(input=teacher_input_ids, dim=-1, index=teacher_seqidx)
+            teacher_logits = torch.gather(input=teacher_logits, dim=-2, index=teacher_seqidx.unsqueeze(-1).expand(-1, -1, TC))
 
             # map teacher input token_ids and logits to student token_ids and logits
             teacher_targets = self.teacher2student_tok_idx[teacher_input_ids[:, 1:]]
+            teacher_input_ids = self.teacher2student_tok_idx[teacher_input_ids] 
+
+            # print("student ids")
+            # print(idx[1].tolist())
+            # print("teacher ids")
+            # print(teacher_targets[1].tolist())
+            # print("")
+            print("matching student,teacher input_ids:", torch.sum(idx.eq(teacher_input_ids)))
+
             #teacher_logits = teacher_logits[:, :-1, self.student2teacher_tok_idx] # FIXME - what about overlaps? like teach elmer and elma could both map to student elm but we're only taking one of them, should probably add them?
             #teacher_logits = torch.scatter_add(torch.zeros_like(student_logits[:,:-1,:]), dim=-1, index=self.teacher2student_tok_idx, src=teacher_logits)
             teacher_logits = torch.index_add(input=torch.zeros_like(student_logits), dim=-1, index=self.teacher2student_tok_idx, source=teacher_logits)
