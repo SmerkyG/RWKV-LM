@@ -757,7 +757,8 @@ class RWKV(pl.LightningModule):
             
             teacher_output = teacher_model(teacher_input_ids)
             teacher_logits = teacher_output.logits.to(student_logits.dtype)
-
+            #og_teacher_logits = teacher_logits[:, :-1, :]
+            #og_teacher_targets = teacher_input_ids[:, 1:]
 
             # # teacher_loss = F.cross_entropy(teacher_logits[:,:-1,:].contiguous().view(-1, teacher_logits.size(-1)), teacher_input_ids[:,1:].contiguous().view(-1))
             # # print(teacher_loss.item())
@@ -779,9 +780,10 @@ class RWKV(pl.LightningModule):
             # print("")
             print("matching student,teacher input_ids:", torch.sum(idx.eq(teacher_input_ids)))
 
-            #teacher_logits = teacher_logits[:, :-1, self.student2teacher_tok_idx] # FIXME - what about overlaps? like teach elmer and elma could both map to student elm but we're only taking one of them, should probably add them?
+            # WOW this works so much better than index_add! maybe we just need to average things that overlap? I guess we're going from 32k->64k so there won't be much overlap maybe???
+            teacher_logits = teacher_logits[:, :, self.student2teacher_tok_idx] # FIXME - what about overlaps? like teach elmer and elma could both map to student elm but we're only taking one of them, should probably add them?
             #teacher_logits = torch.scatter_add(torch.zeros_like(student_logits[:,:-1,:]), dim=-1, index=self.teacher2student_tok_idx, src=teacher_logits)
-            teacher_logits = torch.index_add(input=torch.zeros_like(student_logits), dim=-1, index=self.teacher2student_tok_idx, source=teacher_logits)
+            #teacher_logits = torch.index_add(input=torch.zeros_like(student_logits), dim=-1, index=self.teacher2student_tok_idx, source=teacher_logits)
             teacher_logits = teacher_logits[:, :-1, :]
 
             # # permute sequence inputs and logits to match student's sequence locations
@@ -804,6 +806,7 @@ class RWKV(pl.LightningModule):
             # # print(student_teacher_loss)
 
 
+            #og_teacher_loss = F.cross_entropy(og_teacher_logits.contiguous().view(-1, og_teacher_logits.size(-1)), og_teacher_targets.contiguous().view(-1))
             teacher_token_loss = F.cross_entropy(teacher_logits.contiguous().view(-1, teacher_logits.size(-1)), teacher_targets.contiguous().view(-1), reduction="none")
             # # need to get rid of tokens that had no reasonable target in student token id space
             # # NOTE - have to check that both the input and target tokens were at a matched beginning location or it doesn't make sense to use this sequence index
@@ -812,7 +815,7 @@ class RWKV(pl.LightningModule):
             teacher_loss = torch.sum(teacher_token_loss * mask) / (torch.sum(mask) + 1e-8)
             #print(teacher_seqidx[0])
 
-            print(teacher_loss.item(), torch.sum(mask).item())
+            print(teacher_loss.item())
 
             
             # # permute sequence inputs and logits to match student's sequence locations
