@@ -801,21 +801,21 @@ class RWKV(pl.LightningModule):
             # # we allow only tokens that end (not start) at the same location for both teacher and student
             # mask = use_tok[:,:-1]
             # mask = mask.contiguous().view(-1)
-            # # student_teacher_token_loss = student_teacher_loss_fn(F.log_softmax(student_logits[:,:-1,:].contiguous().view(-1,C), dim=-1), F.softmax(teacher_logits.contiguous().view(-1,C), dim=-1))
-            # # student_teacher_loss = torch.sum(student_teacher_token_loss * mask.unsqueeze(-1)) / (torch.sum(mask) + 1e-8)
-            # # print(student_teacher_loss)
+            # student_teacher_token_loss = student_teacher_loss_fn(F.log_softmax(student_logits[:,:-1,:].contiguous().view(-1,C), dim=-1), F.softmax(teacher_logits.contiguous().view(-1,C), dim=-1))
+            # student_teacher_loss = torch.sum(student_teacher_token_loss * mask.unsqueeze(-1)) / (torch.sum(mask) + 1e-8)
+            # print("student_teacher_loss", student_teacher_loss.item())
 
 
-            #og_teacher_loss = F.cross_entropy(og_teacher_logits.contiguous().view(-1, og_teacher_logits.size(-1)), og_teacher_targets.contiguous().view(-1))
-            teacher_token_loss = F.cross_entropy(teacher_logits.contiguous().view(-1, teacher_logits.size(-1)), teacher_targets.contiguous().view(-1), reduction="none")
-            # # need to get rid of tokens that had no reasonable target in student token id space
-            # # NOTE - have to check that both the input and target tokens were at a matched beginning location or it doesn't make sense to use this sequence index
-            mask = use_tok[:,:-1]
-            mask = mask.contiguous().view(-1)
-            teacher_loss = torch.sum(teacher_token_loss * mask) / (torch.sum(mask) + 1e-8)
-            #print(teacher_seqidx[0])
+            # #og_teacher_loss = F.cross_entropy(og_teacher_logits.contiguous().view(-1, og_teacher_logits.size(-1)), og_teacher_targets.contiguous().view(-1))
+            # teacher_token_loss = F.cross_entropy(teacher_logits.contiguous().view(-1, teacher_logits.size(-1)), teacher_targets.contiguous().view(-1), reduction="none")
+            # # # need to get rid of tokens that had no reasonable target in student token id space
+            # # # NOTE - have to check that both the input and target tokens were at a matched beginning location or it doesn't make sense to use this sequence index
+            # mask = use_tok[:,:-1]
+            # mask = mask.contiguous().view(-1)
+            # teacher_loss = torch.sum(teacher_token_loss * mask) / (torch.sum(mask) + 1e-8)
+            # #print(teacher_seqidx[0])
 
-            print(teacher_loss.item())
+            # print("teacher_loss", teacher_loss.item())
 
             
             # # permute sequence inputs and logits to match student's sequence locations
@@ -845,20 +845,28 @@ class RWKV(pl.LightningModule):
             # teacher_loss = torch.sum(teacher_token_loss * mask) / (torch.sum(mask) + 1e-8)
             # print(teacher_loss.item())
 
-        #student_teacher_token_loss = student_teacher_loss_fn(F.log_softmax(student_logits[:,:-1,:].contiguous().view(-1,C), dim=-1), F.softmax(teacher_logits.contiguous().view(-1,C), dim=-1))
-        #student_teacher_loss = torch.sum(student_teacher_token_loss * mask.unsqueeze(-1)) / (torch.sum(mask) + 1e-8)
+        mask = use_tok[:,:-1]
+        mask = mask.contiguous().view(-1)
+        temp = 1.0 #2.0
+        student_amt = 0.5
+        student_teacher_loss_fn = nn.KLDivLoss(reduction='none')#"batchmean")
+        #student_teacher_loss = student_teacher_loss_fn(F.log_softmax(student_logits[:,:-1,:].contiguous().view(-1,C), dim=-1), F.softmax(teacher_logits.contiguous().view(-1,C), dim=-1))
+        student_teacher_token_loss = student_teacher_loss_fn(F.log_softmax(student_logits[:,:-1,:].contiguous().view(-1,C) / temp, dim=-1), F.softmax(teacher_logits.contiguous().view(-1,C) / temp, dim=-1)) * (temp ** 2)
+        student_teacher_loss = torch.sum(student_teacher_token_loss * mask.unsqueeze(-1)) / (torch.sum(mask) + 1e-8)
 
-        return loss
-        # print("Loss", loss)
+        #return loss
+        #print("Loss", loss.item())
         # return student_teacher_loss
-        # return 0.5 * loss + 0.5 * student_teacher_loss
+        return dict(loss = (1.0 - student_amt) * loss + student_amt * student_teacher_loss, simple_loss = loss)
         #return L2Wrap.apply(loss, logits)
 
     def training_step_end(self, batch_parts):
         if pl.__version__[0]!='2':
-            all = self.all_gather(batch_parts)
+            loss_all = self.all_gather(batch_parts['simple_loss'])
+            #simple_loss_all = self.all_gather(batch_parts['simple_loss'])
             if self.trainer.is_global_zero:
-                self.trainer.my_loss_all = all
+                self.trainer.my_loss_all = loss_all
+                #self.trainer.my_simple_loss_all = simple_loss_all
 
     def generate_init_weight(self):
         print(
