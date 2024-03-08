@@ -26,9 +26,16 @@ def __nop(ob):
     return ob
 
 
+TCompileBaseline = __nop
+TCompileMax = __nop
+TCompileDisable = __nop
 MyModule = nn.Module
 MyFunction = __nop
-if os.environ["RWKV_JIT_ON"] == "1":
+if os.getenv("RWKV_TORCH_COMPILE", "0").lower() in ("1", "true", "yes"):
+    TCompileBaseline = torch.compile
+    TCompileMax = lambda x: torch.compile(x, mode="reduce-overhead")
+    TCompileDisable = torch._dynamo.disable
+elif os.getenv("RWKV_JIT_ON", "1").lower() in ("1", "true", "yes"):
     MyModule = torch.jit.ScriptModule
     MyFunction = torch.jit.script_method
 
@@ -141,6 +148,7 @@ else:
                 gu = torch.sum(gu, 0).view(H, C//H)
                 return (None, None, None, None, gr, gk, gv, gw, gu)
 
+    @TCompileDisable
     def RUN_CUDA_RWKV5(B, T, C, H, r, k, v, w, u):
         return WKV_5.apply(B, T, C, H, r, k, v, w, u)
 
@@ -468,7 +476,8 @@ class Block(nn.Module):
         if args.dropout > 0:
             self.drop0 = nn.Dropout(p = args.dropout)
             self.drop1 = nn.Dropout(p = args.dropout)
-        
+
+    @TCompileBaseline
     def forward(self, x, x_emb=None):
         args = self.args
         B, T, C = x.size()
