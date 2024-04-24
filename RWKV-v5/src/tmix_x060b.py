@@ -7,9 +7,14 @@ class RWKV_Tmix_x060b(JITModClass):
     def __init__(self, args, layer_id):
         super().__init__()
         self.args = args
+        self.n_embd = args.n_embd
         self.layer_id = layer_id
+        self.dim_ffn = args.n_embd * 2
+        self.dim_k = args.n_embd
+        self.dim_v = args.n_embd
 
-        self.head_size = args.head_size_a
+        self.k_head_size = args.head_size_a
+        self.v_head_size = int(args.head_size_a * self.dim_v / self.dim_k)
         self.n_head = args.dim_att // self.head_size
         assert args.dim_att % self.n_head == 0
 
@@ -30,24 +35,19 @@ class RWKV_Tmix_x060b(JITModClass):
             self.time_maa_w1 = nn.Parameter(torch.zeros(args.n_embd, D_MIX_LORA*3))
             self.time_maa_w2 = nn.Parameter(torch.zeros(3, D_MIX_LORA, args.n_embd).uniform_(-0.01, 0.01))
 
-            tmp = torch.zeros(args.dim_att)
-            for n in range(args.dim_att):
-                zigzag = ((n + 1) % 3 - 1) * 0.1
-                tmp[n] = ratio_0_to_1 * (1 - (n / (args.dim_att - 1))) + zigzag
-
-            self.time_faaaa = nn.Parameter(tmp.reshape(self.n_head, self.head_size))
+        self.time_v_bonus = nn.Parameter(torch.full([self.dim_v], 2.0))
 
         self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
-        self.receptance = nn.Linear(args.n_embd, args.dim_att, bias=False)
-        self.key = nn.Linear(args.n_embd, args.dim_att, bias=False)
-
-        self.value = nn.Linear(args.n_embd, args.dim_att, bias=False)
-        self.output = nn.Linear(args.dim_att, args.n_embd, bias=False)
+        self.receptance = nn.Linear(args.n_embd, args.dim_k, bias=False) # DK params
+        self.key = nn.Linear(args.n_embd, args.dim_k, bias=False) # DK params
+        self.v_ffn_gate = nn.Linear(args.n_embd, args.dim_v + self.dim_ffn + (self.dim_v + self.dim_ffn), bias=False) # 2D(V+F) params
+        self.output = nn.Linear(args.dim_v + self.dim_ffn, args.n_embd, bias=False) # D(V+F) params
         self.ln_x = nn.LayerNorm(args.dim_att)
 
     @JITModMethod
     def jit_func(self, x):
         B, T, C = x.size()
+        H = self.n_head
 
         xx = self.time_shift(x) - x
 
@@ -62,22 +62,19 @@ class RWKV_Tmix_x060b(JITModClass):
 
         r = self.receptance(xr)
         k = self.key(xk)
-        v = self.value(xv)
+        v, ffn, g = self.v_ffn_gate(xv).split([self.dim_v, self.dim_ffn, self.dim_v+self.dim_ffn], dim=-1)
         w = 1.0 - torch.sigmoid(k)
 
-        return r, k, v, w
+        # FIXME - GQA
 
-    @JITModMethod
-    def jit_func_2(self, x):
+        # FIXME - support different rk, v sizing
+        x = RUN_CUDA_RWKV6(B, T, C, H, r, k, v, w, u=torch.zeros(self.n_head, self.k_head_size))
+
+        # v bonus
+        x = x + self.time_v_bonus * (k.mT @ v)
+
         x = self.ln_x(x)
+        x = torch.cat([x, ffn], dim=-1)
+        x = x * F.silu(g)
         x = self.output(x)
         return x
-
-    def forward(self, x):
-        B, T, C = x.size()
-        H = self.n_head
-
-        r, k, v, w = self.jit_func(x)
-        x = RUN_CUDA_RWKV6(B, T, C, H, r, k, v, w, u=self.time_faaaa)
-
-        return self.jit_func_2(x)
