@@ -19,7 +19,8 @@ class RWKV_CMix_x060b(JITModClass):
             self.time_maa_r = nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0))
 
         self.key = nn.Linear(args.n_embd, args.dim_ffn, bias=False)
-        self.receptance = nn.Linear(args.n_embd, args.n_embd, bias=False)
+        GATE_EXP_DIM = max(64, args.n_embd // 16)
+        self.receptance = DDLorExp(in_dim=args.n_embd, hidden_dim=GATE_EXP_DIM, out_dim=args.n_embd)
         self.value = nn.Linear(args.dim_ffn, args.n_embd, bias=False)
 
     @JITModMethod
@@ -31,4 +32,20 @@ class RWKV_CMix_x060b(JITModClass):
         k = self.key(xk)
         k = torch.relu(k) ** 2
         kv = self.value(k)
-        return torch.sigmoid(self.receptance(xr)) * kv
+        return self.receptance(xr) * kv
+
+class DDLorExp(nn.Module):
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int):
+        super().__init__()
+        self.in_dim = in_dim
+        self.hidden_dim = hidden_dim
+        self.out_dim = out_dim
+
+        self.w1 = nn.Parameter(torch.empty(in_dim, hidden_dim).uniform_(-0.01, 0.01))
+        self.w2 = nn.Parameter(torch.zeros(hidden_dim, out_dim))
+        self.gmult = nn.Parameter(torch.ones(out_dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        glora = (torch.tanh(x @ self.w1) @ self.w2).exp()
+        gate = self.gmult.to(glora) * glora
+        return gate
