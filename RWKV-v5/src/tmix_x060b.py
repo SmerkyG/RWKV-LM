@@ -61,9 +61,9 @@ class RWKV_Tmix_x060b(JITModClass):
         xr = x + xx * (self.time_maa_r + mr)
 
         r = self.receptance(xr)
-        k = self.key(xk)
+        k = torch.sigmoid(self.key(xk))
         v, ffn, g = self.v_ffn_gate(xv).split([self.dim_v, self.dim_ffn, self.dim_v+self.dim_ffn], dim=-1)
-        w = 1.0 - torch.sigmoid(k)
+        w = 1.0 - k
 
         # FIXME - GQA
 
