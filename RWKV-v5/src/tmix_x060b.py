@@ -15,7 +15,7 @@ class RWKV_Tmix_x060b(JITModClass):
 
         self.k_head_size = args.head_size_a
         self.v_head_size = int(args.head_size_a * self.dim_v / self.dim_k)
-        self.n_head = args.dim_att // self.head_size
+        self.n_head = args.dim_att // self.k_head_size
         assert args.dim_att % self.n_head == 0
 
         with torch.no_grad():
@@ -38,14 +38,14 @@ class RWKV_Tmix_x060b(JITModClass):
         self.time_v_bonus = nn.Parameter(torch.full([self.dim_v], 2.0))
 
         self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
-        self.receptance = nn.Linear(args.n_embd, args.dim_k, bias=False) # DK params
-        self.key = nn.Linear(args.n_embd, args.dim_k, bias=False) # DK params
-        self.v_ffn_gate = nn.Linear(args.n_embd, args.dim_v + self.dim_ffn + (self.dim_v + self.dim_ffn), bias=False) # 2D(V+F) params
-        self.output = nn.Linear(args.dim_v + self.dim_ffn, args.n_embd, bias=False) # D(V+F) params
+        self.receptance = nn.Linear(args.n_embd, self.dim_k, bias=False) # DK params
+        self.key = nn.Linear(args.n_embd, self.dim_k, bias=False) # DK params
+        self.v_ffn_gate = nn.Linear(args.n_embd, self.dim_v + self.dim_ffn + (self.dim_v + self.dim_ffn), bias=False) # 2D(V+F) params
+        self.output = nn.Linear(self.dim_v + self.dim_ffn, args.n_embd, bias=False) # D(V+F) params
         self.ln_x = nn.LayerNorm(args.dim_att)
 
     @JITModMethod
-    def jit_func(self, x):
+    def forward(self, x):
         B, T, C = x.size()
         H = self.n_head
 
@@ -63,12 +63,14 @@ class RWKV_Tmix_x060b(JITModClass):
         r = self.receptance(xr)
         k = (-self.key(xk).exp()).exp()
         v, ffn, g = self.v_ffn_gate(xv).split([self.dim_v, self.dim_ffn, self.dim_v+self.dim_ffn], dim=-1)
+        v = v.contiguous()
         w = 1.0 - k
+        u = torch.zeros(self.n_head, self.k_head_size, device=r.device, dtype=r.dtype)
 
         # FIXME - GQA
 
         # FIXME - support different rk, v sizing
-        x = RUN_CUDA_RWKV6(B, T, C, H, r, k, v, w, u=torch.zeros(self.n_head, self.k_head_size))
+        x = RUN_CUDA_RWKV6(B, T, C, H, r, k, v, w, u)
 
         # v bonus
         x = x + r @ k.mT @ (self.time_v_bonus * v)
