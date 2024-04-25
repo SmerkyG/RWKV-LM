@@ -61,7 +61,7 @@ class RWKV_Tmix_x060b(JITModClass):
         xr = x + xx * (self.time_maa_r + mr)
 
         r = self.receptance(xr)
-        k = torch.sigmoid(self.key(xk))
+        k = (-self.key(xk).exp()).exp()
         v, ffn, g = self.v_ffn_gate(xv).split([self.dim_v, self.dim_ffn, self.dim_v+self.dim_ffn], dim=-1)
         w = 1.0 - k
 
@@ -71,7 +71,7 @@ class RWKV_Tmix_x060b(JITModClass):
         x = RUN_CUDA_RWKV6(B, T, C, H, r, k, v, w, u=torch.zeros(self.n_head, self.k_head_size))
 
         # v bonus
-        x = x + self.time_v_bonus * (k.mT @ v)
+        x = x + r @ k.mT @ (self.time_v_bonus * v)
 
         x = self.ln_x(x)
         x = torch.cat([x, ffn], dim=-1)
